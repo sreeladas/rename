@@ -3,6 +3,11 @@ name = "rename"
 version = "0.1.0"
 authors = ["Sreela <sreela.das@gmail.com>"]
 edition = "2021"
+description = "An intuitive file rename tool"
+keywords = ["renaming", "regex", "files", "sed"]
+homepage = "https://github.com/sreeladas/rename"
+repository = "https://github.com/sreeladas/rename.git"
+categories = ["command-line-utilities", "file-processing", "development-tools"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,5 +15,6 @@ edition = "2021"
 colored = "2.0.4"
 clap = { version = "4.4.2", features = ["derive"] }
 getch = "0.3.1"
-glob = "0.3.1"
+globwalk = "0.8.1"
+regex = "1.9.5"
 serde = { version = "1.0", features = ["derive"] }

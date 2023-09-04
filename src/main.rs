@@ -1,15 +1,13 @@
 use colored::*;
-use glob;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{LineWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
-
 use clap::Parser;
 use std::error::Error;
-
 use clap::{arg, command};
+extern crate globwalk;
 
 #[derive(PartialEq)]
 enum FileOutcome {
@@ -53,9 +51,9 @@ macro_rules! die
 #[derive(Parser, Debug)] // requires `derive` feature
 #[command(term_width = 0)] // Just to make testing across clap features easier
 struct Arguments {
-    /// Patterns
-    #[arg(short = 'p', long)]
-    patterns: Vec<String>,
+    /// Files selection pattern
+    #[arg(short = 'f', long)]
+    files: Vec<String>,
 
     /// Whether or not to include extensions in the renaming/patterns
     #[arg(short = 'x', long, default_value_t = true)]
@@ -82,10 +80,10 @@ fn main() {
 fn list_files(args: &Arguments) -> Vec<FileToRename> {
     let mut filenames = Vec::<FileToRename>::new();
     let mut invalid_indices = Vec::<usize>::new();
-    let patterns = &args.patterns;
+    let files = &args.files;
 
-    for (index, pattern) in patterns.into_iter().enumerate() {
-        let glob_result = glob::glob(&pattern);
+    for (index, file) in files.into_iter().enumerate() {
+        let glob_result = globwalk::glob(&file);
         let paths = match glob_result {
             Ok(g) => g,
             Err(_) => {
@@ -113,7 +111,7 @@ fn list_files(args: &Arguments) -> Vec<FileToRename> {
                 .unwrap_or_else(|| die!("Unable to get file name out of path."));
 
             filenames.push(FileToRename {
-                full_path_before: path.to_owned(),
+                full_path_before: path,
                 full_path_after: PathBuf::new(),
                 filename_before: relevant_part_of_file_name.to_owned(),
                 filename_after: OsString::new(),
@@ -143,7 +141,7 @@ fn list_files(args: &Arguments) -> Vec<FileToRename> {
 
 fn handle_degenerate_cases(args: &Arguments, files: &Vec<FileToRename>) {
     if files.len() == 0 {
-        if args.patterns.len() == 1 {
+        if args.files.len() == 1 {
             println!("No files matched pattern.");
         } else {
             println!("No files matched any patterns.");
@@ -236,95 +234,6 @@ fn validate_filenames(
     Ok(())
 }
 
-fn ask_what_to_do_when_stuck(stuck_at_file: &FileToRename) -> ActionWhenStuck {
-    let friendly_name_before = &stuck_at_file
-        .full_path_before
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let friendly_name_after = &stuck_at_file
-        .full_path_after
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-
-    println!(
-        "{} Can't rename '{}' -> '{}'.",
-        "HALT. ".yellow(),
-        friendly_name_before.yellow(),
-        friendly_name_after.yellow()
-    );
-    println!("       {}{}", "r".bright_cyan(), ": Retry".cyan());
-    println!("       {}{}", "s".bright_cyan(), ": Skip this file".cyan());
-    println!("       {}{}", "a".bright_cyan(), ": Abort here".cyan());
-    println!("       {}{}", "u".bright_cyan(), ": Undo all".cyan());
-    print!("{}", "       [r/s/u/a]: ".blue());
-    std::io::stdout().flush().unwrap();
-    let mut key: char = '_';
-    let mut action = None::<ActionWhenStuck>;
-    while action == None {
-        let getch_result = getch::Getch::new().getch();
-        if let Ok(k) = getch_result {
-            key = k as char
-        };
-        action = match getch_result {
-            Ok(b'r') | Ok(b'R') => Some(ActionWhenStuck::Retry),
-            Ok(b's') | Ok(b'S') => Some(ActionWhenStuck::Skip),
-            Ok(b'a') | Ok(b'A') => Some(ActionWhenStuck::Abort),
-            Ok(b'u') | Ok(b'U') => Some(ActionWhenStuck::Rollback),
-            _ => None,
-        };
-    }
-    println!("{}", key);
-    action.unwrap()
-}
-
-fn ask_what_to_do_when_stuck_rolling_back(
-    stuck_at_file: &FileToRename,
-) -> ActionWhenStuckRollingBack {
-    let friendly_name_before = &stuck_at_file
-        .full_path_before
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let friendly_name_after = &stuck_at_file
-        .full_path_after
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-
-    println!(
-        "{} Can't undo rename '{}' back to '{}'.",
-        "HALT. ".yellow(),
-        friendly_name_after.yellow(),
-        friendly_name_before.yellow()
-    );
-    println!("       {}{}", "r".bright_cyan(), ": Retry".cyan());
-    println!("       {}{}", "s".bright_cyan(), ": Skip this file".cyan());
-    println!("       {}{}", "a".bright_cyan(), ": Abort here".cyan());
-    print!("{}", "       [r/s/u]: ".blue());
-    std::io::stdout().flush().unwrap();
-    let mut key: char = '_';
-    let mut action = None::<ActionWhenStuckRollingBack>;
-    while action == None {
-        let getch_result = getch::Getch::new().getch();
-        if let Ok(k) = getch_result {
-            key = k as char
-        };
-        action = match getch_result {
-            Ok(b'r') | Ok(b'R') => Some(ActionWhenStuckRollingBack::Retry),
-            Ok(b's') | Ok(b'S') => Some(ActionWhenStuckRollingBack::Skip),
-            Ok(b'a') | Ok(b'A') => Some(ActionWhenStuckRollingBack::AbortRollback),
-            _ => None,
-        };
-    }
-    println!("{}", key);
-    action.unwrap()
-}
 
 fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
     fn rename_file_if_safe(p: &Path, q: &Path) -> Result<(), ()> {
@@ -364,18 +273,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
                 file.outcome = FileOutcome::Renamed;
                 index += 1;
             }
-            Err(_) => match ask_what_to_do_when_stuck(&file) {
-                ActionWhenStuck::Retry => continue,
-                ActionWhenStuck::Abort => break,
-                ActionWhenStuck::Skip => {
-                    index += 1;
-                    continue;
-                }
-                ActionWhenStuck::Rollback => {
-                    rollback = true;
-                    break;
-                }
-            },
+            Err(_) => die!("file renaming was not safe"),
         }
     }
 
@@ -396,14 +294,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
                     index += 1;
                     continue;
                 }
-                Err(_) => match ask_what_to_do_when_stuck_rolling_back(&file) {
-                    ActionWhenStuckRollingBack::Retry => continue,
-                    ActionWhenStuckRollingBack::AbortRollback => break,
-                    ActionWhenStuckRollingBack::Skip => {
-                        index += 1;
-                        continue;
-                    }
-                },
+                Err(_) => die!("file renaming was not safe"),
             }
         }
     }
