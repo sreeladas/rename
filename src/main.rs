@@ -1,49 +1,29 @@
 use colored::*;
-use confy;
 use glob;
-use serde::{Deserialize, Serialize};
-use std::default::Default;
-use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, LineWriter, Write};
+use std::io::{LineWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command};
+use std::process::exit;
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    editor_executable: String
-}
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            editor_executable: "vim".to_owned()
-        }
-    }
-}
+use clap::Parser;
+use std::error::Error;
 
-struct Arguments {
-    patterns:              Vec<String>,
-    editor_executable:     Option<String>,
-    set_editor_executable: Option<String>,
-    include_extensions:    bool,
-    dry_run:               bool,
-    usage:                 bool
-}
+use clap::{arg, command};
 
 #[derive(PartialEq)]
 enum FileOutcome {
     Renamed,
     RenameWasNoop,
-    Unchanged
+    Unchanged,
 }
 
 struct FileToRename {
     full_path_before: PathBuf,
-    full_path_after:  PathBuf,
-    filename_before:  OsString,
-    filename_after:   OsString,
-    outcome:          FileOutcome
+    full_path_after: PathBuf,
+    filename_before: OsString,
+    filename_after: OsString,
+    outcome: FileOutcome,
 }
 
 #[derive(PartialEq)]
@@ -51,14 +31,14 @@ enum ActionWhenStuck {
     Retry,
     Skip,
     Abort,
-    Rollback
+    Rollback,
 }
 
 #[derive(PartialEq)]
 enum ActionWhenStuckRollingBack {
     Retry,
     Skip,
-    AbortRollback
+    AbortRollback,
 }
 
 macro_rules! die
@@ -70,114 +50,33 @@ macro_rules! die
     }}
 }
 
-fn main() {
-    let mut config = confy::load::<Config>("brnt").unwrap_or(Config::default());
-    let args = parse_arguments();
-    if args.usage == true {
-        print_usage();
-        exit(0);
-    }
-    if let Some(x) = &args.set_editor_executable {
-        config.editor_executable = x.to_owned();
-        confy::store("brnt", &config)
-            .unwrap_or_else(|_| die!("Unable to save config file."));
-        println!("Editor set to '{}'.", config.editor_executable);
-        exit(0);
-    }
+#[derive(Parser, Debug)] // requires `derive` feature
+#[command(term_width = 0)] // Just to make testing across clap features easier
+struct Arguments {
+    /// Patterns
+    #[arg(short = 'p', long)]
+    patterns: Vec<String>,
 
+    /// Whether or not to include extensions in the renaming/patterns
+    #[arg(short = 'x', long, default_value_t = true)]
+    include_extensions: bool,
+
+    /// Flag to dry-run the file renaming -- with this flag enabled the file-renaming map is simply printed to std-out
+    #[arg(short = 'd', long, default_value_t = false)]
+    dry_run: bool,
+}
+
+fn main() {
+    let args = Arguments::parse();
     let mut files = list_files(&args);
     handle_degenerate_cases(&args, &files);
 
-    let buffer_filename = std::env::temp_dir().join(".brnt_buffer");
+    let buffer_filename = std::env::temp_dir().join(".rename_buffer");
     write_filenames_to_buffer(&buffer_filename, &files);
-    invoke_editor(&config, &args, &buffer_filename);
-    read_filenames_from_buffer(&buffer_filename, &mut files, &args);
+    let _ = read_filenames_from_buffer(&buffer_filename, &mut files, &args);
 
     execute_rename(&args, &mut files);
     print_state(&files);
-}
-
-fn print_usage() {
-    let version = env!("CARGO_PKG_VERSION");
-    println!("");
-    println!("brnt {}", version);
-    println!("Rename files in bulk using your text editor of choice.");
-    println!("");
-    println!("    brnt");
-    println!("        [-e|--editor EDITOR-PATHNAME]");
-    println!("        [-x|--include-extensions]");
-    println!("        [--dry-run]");
-    println!("        SEARCH-PATTERN...");
-    println!("");
-    println!("    brnt --set-editor EDITOR-PATHNAME");
-    println!("");
-    println!("brnt will collect all the files which match the search patterns provided");
-    println!("into a list, then display that list in your text editor of your choosing.");
-    println!("Edit the filenames at your leisure, then close the editor and brnt");
-    println!("will rename the files correspondingly.");
-    println!("");
-}
-
-fn parse_arguments() -> Arguments {
-    let mut result = Arguments {
-        patterns:              Vec::new(),
-        editor_executable:     None,
-        set_editor_executable: None,
-        include_extensions:    false,
-        dry_run:               false,
-        usage:                 false
-    };
-    let mut force_patterns = false;
-    let mut next_is_editor_executable = false;
-    let mut next_is_set_editor_executable = false;
-
-    for arg in env::args().skip(1) {
-        if next_is_editor_executable == true {
-            result.editor_executable = Some(arg);
-            next_is_editor_executable = false;
-        } else if next_is_set_editor_executable == true {
-            result.set_editor_executable = Some(arg.to_owned());
-            result.editor_executable = Some(arg.to_owned());
-            next_is_set_editor_executable = false;
-        } else if arg.starts_with("--") == true && force_patterns == false {
-            match arg.as_str() {
-                "--usage" => result.usage = true,
-                "--help" => result.usage = true,
-                "--editor" => next_is_editor_executable = true,
-                "--set-editor" => next_is_set_editor_executable = true,
-                "--include-extensions" => result.include_extensions = true,
-                "--dry-run" => result.dry_run = true,
-                "--" => force_patterns = true,
-                _ => die!("Don't understand option {}.", arg)
-            }
-        } else if arg.starts_with("-") == true && force_patterns == false {
-            match arg.as_str() {
-                "-e" => next_is_editor_executable = true,
-                "-x" => result.include_extensions = true,
-                _ => die!("Don't understand option {}.", arg)
-            }
-        } else {
-            result.patterns.push(arg);
-        }
-    }
-
-    if next_is_editor_executable == true || next_is_set_editor_executable == true {
-        result.usage = true;
-    }
-
-    if result.set_editor_executable != None {
-        // require that no globs were provided
-        if result.patterns.len() != 0 {
-            result.usage = true;
-        }
-    } else {
-        // require that some globs were provided
-        if result.patterns.len() == 0 {
-            result.usage = true;
-        }
-    }
-
-    result
 }
 
 fn list_files(args: &Arguments) -> Vec<FileToRename> {
@@ -215,10 +114,10 @@ fn list_files(args: &Arguments) -> Vec<FileToRename> {
 
             filenames.push(FileToRename {
                 full_path_before: path.to_owned(),
-                full_path_after:  PathBuf::new(),
-                filename_before:  relevant_part_of_file_name.to_owned(),
-                filename_after:   OsString::new(),
-                outcome:          FileOutcome::Unchanged
+                full_path_after: PathBuf::new(),
+                filename_before: relevant_part_of_file_name.to_owned(),
+                filename_after: OsString::new(),
+                outcome: FileOutcome::Unchanged,
             });
         }
     }
@@ -256,7 +155,7 @@ fn handle_degenerate_cases(args: &Arguments, files: &Vec<FileToRename>) {
 fn write_filenames_to_buffer(buffer_filename: &Path, files: &Vec<FileToRename>) {
     let buffer_file = match File::create(&buffer_filename) {
         Ok(file) => file,
-        Err(_) => die!("Unable to open buffer file for writing.")
+        Err(_) => die!("Unable to open buffer file for writing."),
     };
     let mut writer = LineWriter::new(buffer_file);
 
@@ -273,83 +172,68 @@ fn write_filenames_to_buffer(buffer_filename: &Path, files: &Vec<FileToRename>) 
     }
 }
 
-fn invoke_editor(config: &Config, args: &Arguments, buffer_filename: &Path) {
-    let editor: &str = match &args.editor_executable {
-        Some(e) => &e,
-        None => &config.editor_executable
-    };
-
-    let status = Command::new(editor)
-        .args(buffer_filename.to_str())
-        .status()
-        .unwrap_or_else(|_| die!("Failed to start editor ({}).", editor));
-
-    if status.success() == false {
-        die!("Editor returned non-zero exit code.");
-    }
-}
-
 fn read_filenames_from_buffer(
     buffer_filename: &Path,
     files: &mut Vec<FileToRename>,
-    args: &Arguments
-) {
-    let buffer_file = File::open(buffer_filename)
-        .unwrap_or_else(|_| die!("Unable to open buffer file for reading."));
-    let reader = BufReader::new(buffer_file);
-    let mut filenames_coming_in = Vec::<OsString>::new();
+    args: &Arguments,
+) -> Result<(), Box<dyn Error>> {
+    let filenames_coming_in = read_filenames_from_file(buffer_filename)?;
+    validate_filenames(files.len(), &filenames_coming_in)?;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => {
-                println!("Unable to read buffer file.");
-                exit(1);
-            }
-        };
-
-        let trimmed = line.trim().to_owned();
-        if trimmed.len() > 0 {
-            filenames_coming_in.push(OsString::from(trimmed));
-        }
-    }
-
-    if filenames_coming_in.len() < files.len() {
-        die!(
-            "Not enough filenames in text file after edit ({} instead of {}).",
-            filenames_coming_in.len(),
-            files.len()
-        );
-    } else if filenames_coming_in.len() > files.len() {
-        die!(
-            "Too many filenames in text file after edit ({} instead of {}).",
-            filenames_coming_in.len(),
-            files.len()
-        );
-    }
-
-    let new_filename_for_file = |file: &FileToRename| -> OsString {
-        if args.include_extensions == true {
-            file.filename_after.to_owned()
+    for (file, new_filename) in files.iter_mut().zip(filenames_coming_in.iter()) {
+        file.filename_after = if args.include_extensions {
+            new_filename.clone().into()
         } else {
             let extension = file.full_path_before.extension();
-            let mut new_name = file.filename_after.to_owned();
-            if let Some(e) = extension {
-                new_name.push(".");
-                new_name.push(e);
-            }
-            new_name
-        }
-    };
-    let new_path_for_file = |file: &FileToRename| -> PathBuf {
-        file.full_path_before
-            .with_file_name(new_filename_for_file(file))
-    };
-
-    for n in 0..files.len() {
-        files[n].filename_after = filenames_coming_in[n].to_owned();
-        files[n].full_path_after = new_path_for_file(&files[n]);
+            new_filename
+                .clone()
+                .with_extension(extension.unwrap_or_default())
+                .into()
+        };
+        file.full_path_after = file.full_path_before.with_file_name(&file.filename_after);
     }
+
+    Ok(())
+}
+
+fn read_filenames_from_file(
+    buffer_filename: &Path,
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let content = std::fs::read_to_string(buffer_filename)?;
+    let filenames_coming_in: Vec<PathBuf> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                Some(PathBuf::from(trimmed))
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(filenames_coming_in)
+}
+
+fn validate_filenames(
+    expected_count: usize,
+    filenames_coming_in: &[PathBuf],
+) -> Result<(), Box<dyn Error>> {
+    if filenames_coming_in.len() < expected_count {
+        return Err(format!(
+            "Not enough filenames in text file after edit ({} instead of {}).",
+            filenames_coming_in.len(),
+            expected_count
+        )
+        .into());
+    } else if filenames_coming_in.len() > expected_count {
+        return Err(format!(
+            "Too many filenames in text file after edit ({} instead of {}).",
+            filenames_coming_in.len(),
+            expected_count
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn ask_what_to_do_when_stuck(stuck_at_file: &FileToRename) -> ActionWhenStuck {
@@ -390,7 +274,7 @@ fn ask_what_to_do_when_stuck(stuck_at_file: &FileToRename) -> ActionWhenStuck {
             Ok(b's') | Ok(b'S') => Some(ActionWhenStuck::Skip),
             Ok(b'a') | Ok(b'A') => Some(ActionWhenStuck::Abort),
             Ok(b'u') | Ok(b'U') => Some(ActionWhenStuck::Rollback),
-            _ => None
+            _ => None,
         };
     }
     println!("{}", key);
@@ -398,7 +282,7 @@ fn ask_what_to_do_when_stuck(stuck_at_file: &FileToRename) -> ActionWhenStuck {
 }
 
 fn ask_what_to_do_when_stuck_rolling_back(
-    stuck_at_file: &FileToRename
+    stuck_at_file: &FileToRename,
 ) -> ActionWhenStuckRollingBack {
     let friendly_name_before = &stuck_at_file
         .full_path_before
@@ -435,7 +319,7 @@ fn ask_what_to_do_when_stuck_rolling_back(
             Ok(b'r') | Ok(b'R') => Some(ActionWhenStuckRollingBack::Retry),
             Ok(b's') | Ok(b'S') => Some(ActionWhenStuckRollingBack::Skip),
             Ok(b'a') | Ok(b'A') => Some(ActionWhenStuckRollingBack::AbortRollback),
-            _ => None
+            _ => None,
         };
     }
     println!("{}", key);
@@ -449,7 +333,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
         };
         match fs::rename(p, q) {
             Ok(_) => Ok(()),
-            Err(_) => Err(())
+            Err(_) => Err(()),
         }
     }
 
@@ -467,7 +351,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
     let mut index = 0;
     let mut rollback = false;
     while index < files.len() {
-        let mut file = &mut files[index];
+        let file = &mut files[index];
 
         if file.full_path_after == file.full_path_before {
             file.outcome = FileOutcome::RenameWasNoop;
@@ -491,7 +375,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
                     rollback = true;
                     break;
                 }
-            }
+            },
         }
     }
 
@@ -500,7 +384,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
 
         index = 0;
         while index < files.len() {
-            let mut file = &mut files[index];
+            let file = &mut files[index];
             if file.outcome != FileOutcome::Renamed {
                 index += 1;
                 continue;
@@ -519,7 +403,7 @@ fn execute_rename(args: &Arguments, files: &mut Vec<FileToRename>) {
                         index += 1;
                         continue;
                     }
-                }
+                },
             }
         }
     }
@@ -534,7 +418,7 @@ fn print_state(files: &Vec<FileToRename>) {
         match f.outcome {
             FileOutcome::Renamed => renamed += 1,
             FileOutcome::RenameWasNoop => noop += 1,
-            FileOutcome::Unchanged => unchanged += 1
+            FileOutcome::Unchanged => unchanged += 1,
         }
     }
 
